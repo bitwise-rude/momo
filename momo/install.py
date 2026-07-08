@@ -157,7 +157,7 @@ if __name__ == "__main__":
 
     # dependency 1 : Java 17 (OpenJDK)
     if not check_java():
-        print(" Error: OpenJDK 17 environment dependency missing.")
+        print(" Error: OpenJDK 17 environment dependency missing. Please Install the OpenJDK 17 version of Java")
         sys.exit(1)
 
     # dependency 2: Android Command line Tools
