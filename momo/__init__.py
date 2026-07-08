@@ -16,6 +16,8 @@ if not momo_dir.is_dir():
     
     # Files needed to be copied
     source_xml = module_dir / "AndroidManifest.xml"  
+    source_java = module_dir / "MainActivity.java"
+    source_c = module_dir / "glue.c"
 
     print("Initialized a directory .momo in the project folder. Do not modify it.")
     momo_dir.mkdir(parents=True, exist_ok=True)
@@ -23,11 +25,13 @@ if not momo_dir.is_dir():
     subfolders = ["build", "src"]
     for folder in subfolders:
         (momo_dir / folder).mkdir(parents=True, exist_ok=True)
+    
+    destination_xml = momo_dir / source_xml.name
+    shutil.copy2(source_xml, destination_xml)
+    destination_java = momo_dir / "src"/ source_java.name
+    shutil.copy2(source_c, destination_java)
+    destination_c = momo_dir / "src"/ source_c.name
+    shutil.copy2(source_c, destination_c)
 
-    if source_xml.exists():
-        destination_xml = momo_dir / source_xml.name
-        shutil.copy2(source_xml, destination_xml)
-    else:
-        print(f"SOME ERROR OCCURED IN THE INSTALLATION OF MOMO")
 else:
     print("Momo is already initialized in your project folder. Please do not modify or delete the .momo folder in this directory.")
