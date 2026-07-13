@@ -24,6 +24,7 @@ if not momo_dir.exists():
 
     folders = [
         "build",
+        "build/dex"
         "assets/python/lib/python3.14",
         "assets/python/scripts",
         "lib/arm64-v8a",
