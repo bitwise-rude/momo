@@ -5,6 +5,7 @@
 # NEVER RUN THE FILE ALWAYS CALL FROM SOMEWHERE ELSE
 
 import os
+import shutil
 import inspect
 import subprocess
 import zipfile
@@ -45,6 +46,7 @@ class Paths:
     apk_unsigned: Path
     apk_aligned: Path
     apk_signed: Path
+    apk_base : Path
 
 
 def _build_paths(project_dir):
@@ -77,6 +79,8 @@ def _build_paths(project_dir):
     APK_UNSIGNED = BUILD / "app-unsigned.apk"
     APK_ALIGNED = BUILD / "aligned.apk"
     APK_SIGNED = BUILD / "app.apk"
+    APK_BASE = BUILD / "app-base.apk"
+    
 
     return Paths(
         project=PROJECT,
@@ -102,24 +106,15 @@ def _build_paths(project_dir):
         apk_unsigned=APK_UNSIGNED,
         apk_aligned=APK_ALIGNED,
         apk_signed=APK_SIGNED,
+        apk_base = APK_BASE
     )
 
 
 def _resolve():
-    """
-    Stack layout at this point:
-      stack[0] -> _resolve 
-      stack[1] -> the public API function
-      stack[2] -> the user code that called
-      
-    """
     #TODO: RESOLVING MAYBE BUGGY SOMETIMES FIX IT
+    # This should resolve the current working directory to fix importing of the library ()
 
-    caller_frame = inspect.stack()[2]
-    caller_path = Path(caller_frame.filename).resolve()
-    project_dir = caller_path.parent
-    return _build_paths(project_dir)
-
+    return _build_paths(Path(os.getcwd()))
 
 def add_file_to_apk(apk_path: Path, file_path: Path, arcname=None):
     if arcname is None:
@@ -257,6 +252,42 @@ def lazy_clean(p: Paths):
 def uninstall(p: Paths):
     run("Uninstalling previous version", [p.adb, 'uninstall', 'com.example.helloworld'], check=False)
 
+def quick_rebuild():
+    p = _resolve()
+
+    if not p.apk_base.exists():
+        print("No base apk found. Please run build_python()")
+        return
+
+    uninstall(p)
+
+    p.build.mkdir(parents=True, exist_ok=True)
+
+    lazy_clean(p)  
+    run("Removing stale unsigned apk", ["rm", "-f", p.apk_unsigned], check=False)
+
+    print("Restoring base apk (dex + native libs, no assets)")
+    shutil.copy(p.apk_base, p.apk_unsigned)
+
+    print("Adding assets (your changed scripts + stdlib)")
+    add_directory_to_apk(p.apk_unsigned, p.assets, base_dir=p.momo)
+
+    run(
+        "Align and flatten the output apk",
+        [p.zipalign, "-v", "4", p.apk_unsigned, p.apk_aligned],
+    )
+
+    if not (p.project / "mykey.jks").exists():
+        create_key(p)
+
+    sign_key(p)
+
+    run("Running ADB to install", [p.adb, 'install', p.apk_signed])
+
+    run(
+        "Opening App on Device",
+        [p.adb, "shell", "monkey", "-p", "com.example.helloworld", "-c", "android.intent.category.LAUNCHER", "1"],
+    )
 
 def build_python():
     p = _resolve()
@@ -328,6 +359,10 @@ def build_python():
         p.lib / "arm64-v8a" / "libnative-lib.so",
         "lib/arm64-v8a/libnative-lib.so",
     )
+
+    print("Snapshotting base apk for quick rebuilds")
+    shutil.copy(p.apk_unsigned, p.apk_base)
+
 
     print("Adding assets (Python stdlib)")
     add_directory_to_apk(p.apk_unsigned, p.assets, base_dir=p.momo)

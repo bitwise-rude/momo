@@ -3,6 +3,7 @@ from pathlib import Path
 import shutil
 
 
+# REPLACE THIS WITH OS.CWD? TODO
 caller_frame = inspect.stack()[1]
 caller_dir = Path(caller_frame.filename).resolve().parent
 
