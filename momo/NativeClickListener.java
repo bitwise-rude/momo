@@ -2,12 +2,8 @@ package com.example.helloworld;
 
 import android.view.View;
 
-/**
- * Importand Bridge between a button's OnClick() function and the native code
- */
-
+// Bridges the button click python -> java
 public class NativeClickListener implements View.OnClickListener {
-
     private final int handle;
 
     public NativeClickListener(int handle) {

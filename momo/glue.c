@@ -1,4 +1,4 @@
-#include <jni.h>
+##include <jni.h>
 #include <Python.h>
 #include <android/log.h>
 #include <stdio.h>
@@ -17,6 +17,10 @@ jobject  g_app_context = NULL;   // NOTE: must be the Activity itself now, not
                                   // only exists on Activity. See MainActivity.java.
 static int g_python_ready = 0;
 static char g_files_dir[512] = {0};
+
+// COMPLEX_UNIT_SP, from android.util.TypedValue. Hardcoded here so we don't
+// need to touch the TypedValue class just to read a constant.
+#define COMPLEX_UNIT_SP 2
 
 // ── UI handle table ─────────────────────────────────────────────────────────
 // Widgets are never handed to Python as raw jobject pointers. Instead every
@@ -47,6 +51,31 @@ static int store_handle(jobject local_view_ref) {
 
 static int handle_valid(int h) {
     return h >= 0 && h < g_handle_count && g_views[h] != NULL;
+}
+
+// Resolves a CSS-style color string ("#RRGGBB", "#AARRGGBB", or a named
+// color like "red") to an Android color int via android.graphics.Color.
+// Returns 1 on success (writes to *out), 0 on failure (Python exception set).
+static int resolve_color(JNIEnv* env, const char* colorStr, jint* out) {
+    jclass colorClass = (*env)->FindClass(env, "android/graphics/Color");
+    jmethodID parseColor = (*env)->GetStaticMethodID(env, colorClass, "parseColor",
+                                "(Ljava/lang/String;)I");
+    jstring jcolor = (*env)->NewStringUTF(env, colorStr);
+    (*env)->ExceptionClear(env); // clear any pending exception before we probe
+    jint result = (*env)->CallStaticIntMethod(env, colorClass, parseColor, jcolor);
+
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        (*env)->DeleteLocalRef(env, jcolor);
+        (*env)->DeleteLocalRef(env, colorClass);
+        PyErr_Format(PyExc_ValueError, "invalid color string: %s", colorStr);
+        return 0;
+    }
+
+    *out = result;
+    (*env)->DeleteLocalRef(env, jcolor);
+    (*env)->DeleteLocalRef(env, colorClass);
+    return 1;
 }
 
 // Called when loadlibary is called
@@ -201,6 +230,29 @@ static PyObject* py_ui_create_button(PyObject* self, PyObject* args) {
     return PyLong_FromLong(handle);
 }
 
+static PyObject* py_ui_create_input(PyObject* self, PyObject* args) {
+    const char* hint;
+    if (!PyArg_ParseTuple(args, "s", &hint)) return NULL;
+    JNIEnv* env = get_env();
+
+    jclass etClass = (*env)->FindClass(env, "android/widget/EditText");
+    jmethodID ctor = (*env)->GetMethodID(env, etClass, "<init>", "(Landroid/content/Context;)V");
+    jobject et = (*env)->NewObject(env, etClass, ctor, g_app_context);
+
+    jmethodID setHint = (*env)->GetMethodID(env, etClass, "setHint", "(Ljava/lang/CharSequence;)V");
+    jstring jhint = (*env)->NewStringUTF(env, hint);
+    (*env)->CallVoidMethod(env, et, setHint, jhint);
+
+    int handle = store_handle(et);
+
+    (*env)->DeleteLocalRef(env, jhint);
+    (*env)->DeleteLocalRef(env, et);
+    (*env)->DeleteLocalRef(env, etClass);
+
+    if (handle < 0) { PyErr_SetString(PyExc_RuntimeError, "too many widgets"); return NULL; }
+    return PyLong_FromLong(handle);
+}
+
 static PyObject* py_ui_create_layout(PyObject* self, PyObject* args) {
     const char* orientation;
     if (!PyArg_ParseTuple(args, "s", &orientation)) return NULL;
@@ -234,13 +286,109 @@ static PyObject* py_ui_set_text(PyObject* self, PyObject* args) {
     JNIEnv* env = get_env();
     jobject view = g_views[handle];
 
-    // Works for both TextView and Button (Button extends TextView).
+    // Works for TextView, Button, and EditText (all extend TextView).
     jclass viewClass = (*env)->GetObjectClass(env, view);
     jmethodID setText = (*env)->GetMethodID(env, viewClass, "setText", "(Ljava/lang/CharSequence;)V");
     jstring jtext = (*env)->NewStringUTF(env, text);
     (*env)->CallVoidMethod(env, view, setText, jtext);
 
     (*env)->DeleteLocalRef(env, jtext);
+    (*env)->DeleteLocalRef(env, viewClass);
+    Py_RETURN_NONE;
+}
+
+static PyObject* py_ui_get_text(PyObject* self, PyObject* args) {
+    int handle;
+    if (!PyArg_ParseTuple(args, "i", &handle)) return NULL;
+    if (!handle_valid(handle)) {
+        PyErr_SetString(PyExc_ValueError, "invalid widget handle");
+        return NULL;
+    }
+    JNIEnv* env = get_env();
+    jobject view = g_views[handle];
+
+    // getText() -> CharSequence, works for TextView/Button/EditText alike.
+    // We then call toString() on whatever CharSequence impl comes back
+    // (String for TextView/Button, Editable for EditText).
+    jclass viewClass = (*env)->GetObjectClass(env, view);
+    jmethodID getText = (*env)->GetMethodID(env, viewClass, "getText", "()Ljava/lang/CharSequence;");
+    jobject charSeq = (*env)->CallObjectMethod(env, view, getText);
+
+    jclass csClass = (*env)->GetObjectClass(env, charSeq);
+    jmethodID toStringMethod = (*env)->GetMethodID(env, csClass, "toString", "()Ljava/lang/String;");
+    jstring jresult = (jstring)(*env)->CallObjectMethod(env, charSeq, toStringMethod);
+
+    const char* cresult = (*env)->GetStringUTFChars(env, jresult, NULL);
+    PyObject* pyresult = PyUnicode_FromString(cresult);
+    (*env)->ReleaseStringUTFChars(env, jresult, cresult);
+
+    (*env)->DeleteLocalRef(env, jresult);
+    (*env)->DeleteLocalRef(env, csClass);
+    (*env)->DeleteLocalRef(env, charSeq);
+    (*env)->DeleteLocalRef(env, viewClass);
+    return pyresult;
+}
+
+static PyObject* py_ui_set_text_size(PyObject* self, PyObject* args) {
+    int handle;
+    float sp;
+    if (!PyArg_ParseTuple(args, "if", &handle, &sp)) return NULL;
+    if (!handle_valid(handle)) {
+        PyErr_SetString(PyExc_ValueError, "invalid widget handle");
+        return NULL;
+    }
+    JNIEnv* env = get_env();
+    jobject view = g_views[handle];
+
+    jclass viewClass = (*env)->GetObjectClass(env, view);
+    jmethodID setTextSize = (*env)->GetMethodID(env, viewClass, "setTextSize", "(IF)V");
+    (*env)->CallVoidMethod(env, view, setTextSize, (jint)COMPLEX_UNIT_SP, (jfloat)sp);
+
+    (*env)->DeleteLocalRef(env, viewClass);
+    Py_RETURN_NONE;
+}
+
+static PyObject* py_ui_set_text_color(PyObject* self, PyObject* args) {
+    int handle;
+    const char* colorStr;
+    if (!PyArg_ParseTuple(args, "is", &handle, &colorStr)) return NULL;
+    if (!handle_valid(handle)) {
+        PyErr_SetString(PyExc_ValueError, "invalid widget handle");
+        return NULL;
+    }
+    JNIEnv* env = get_env();
+
+    jint color;
+    if (!resolve_color(env, colorStr, &color)) return NULL;
+
+    jobject view = g_views[handle];
+    jclass viewClass = (*env)->GetObjectClass(env, view);
+    jmethodID setTextColor = (*env)->GetMethodID(env, viewClass, "setTextColor", "(I)V");
+    (*env)->CallVoidMethod(env, view, setTextColor, color);
+
+    (*env)->DeleteLocalRef(env, viewClass);
+    Py_RETURN_NONE;
+}
+
+static PyObject* py_ui_set_bg_color(PyObject* self, PyObject* args) {
+    int handle;
+    const char* colorStr;
+    if (!PyArg_ParseTuple(args, "is", &handle, &colorStr)) return NULL;
+    if (!handle_valid(handle)) {
+        PyErr_SetString(PyExc_ValueError, "invalid widget handle");
+        return NULL;
+    }
+    JNIEnv* env = get_env();
+
+    jint color;
+    if (!resolve_color(env, colorStr, &color)) return NULL;
+
+    // setBackgroundColor lives on View, so this works for layouts too.
+    jobject view = g_views[handle];
+    jclass viewClass = (*env)->GetObjectClass(env, view);
+    jmethodID setBgColor = (*env)->GetMethodID(env, viewClass, "setBackgroundColor", "(I)V");
+    (*env)->CallVoidMethod(env, view, setBgColor, color);
+
     (*env)->DeleteLocalRef(env, viewClass);
     Py_RETURN_NONE;
 }
@@ -330,8 +478,13 @@ static PyMethodDef AndroidMethods[] = {
 
     {"ui_create_label",  py_ui_create_label,  METH_VARARGS, "ui_create_label(text) -> handle"},
     {"ui_create_button", py_ui_create_button, METH_VARARGS, "ui_create_button(text) -> handle"},
+    {"ui_create_input",  py_ui_create_input,  METH_VARARGS, "ui_create_input(hint) -> handle"},
     {"ui_create_layout", py_ui_create_layout, METH_VARARGS, "ui_create_layout('vertical'|'horizontal') -> handle"},
     {"ui_set_text",      py_ui_set_text,      METH_VARARGS, "ui_set_text(handle, text)"},
+    {"ui_get_text",      py_ui_get_text,      METH_VARARGS, "ui_get_text(handle) -> text"},
+    {"ui_set_text_size", py_ui_set_text_size, METH_VARARGS, "ui_set_text_size(handle, size_sp)"},
+    {"ui_set_text_color",py_ui_set_text_color,METH_VARARGS, "ui_set_text_color(handle, color_str)"},
+    {"ui_set_bg_color",  py_ui_set_bg_color,  METH_VARARGS, "ui_set_bg_color(handle, color_str)"},
     {"ui_set_onclick",   py_ui_set_onclick,   METH_VARARGS, "ui_set_onclick(handle, callback)"},
     {"ui_add_view",      py_ui_add_view,      METH_VARARGS, "ui_add_view(parent_handle, child_handle)"},
     {"ui_show",          py_ui_show,          METH_VARARGS, "ui_show(handle)"},
@@ -435,8 +588,8 @@ Java_com_example_helloworld_MainActivity_runScript(
         ret = (*env)->NewStringUTF(env, PyUnicode_AsUTF8(result));
     } else {
         LOGE("runScript: no 'result' variable found in script");
-        ret = (*env)->NewStringUTF(env, "error: script must set result = '...'"); // legacy #TODO REMOVE THIS
+        ret = (*env)->NewStringUTF(env, "error: script must set result = '...'");
     }
 
     return ret;
-}
+}include <jni.h>
