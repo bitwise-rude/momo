@@ -3,6 +3,7 @@
 #include <android/log.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <wchar.h>
 
 #define LOG(...) __android_log_print(ANDROID_LOG_DEBUG, "PythonBridge", __VA_ARGS__)
@@ -11,9 +12,42 @@
 // this will be accessed by others through extern, contains the app and jvm contexts
 
 JavaVM*  g_jvm         = NULL;
-jobject  g_app_context = NULL;
+jobject  g_app_context = NULL;   // NOTE: must be the Activity itself now, not
+                                  // getApplicationContext() — setContentView()
+                                  // only exists on Activity. See MainActivity.java.
 static int g_python_ready = 0;
 static char g_files_dir[512] = {0};
+
+// ── UI handle table ─────────────────────────────────────────────────────────
+// Widgets are never handed to Python as raw jobject pointers. Instead every
+// created View gets a small int "handle" that indexes into these tables.
+// This keeps the Python-facing API simple (plain ints) and lets us manage
+// jobject global refs / callback refcounts in one place.
+#define MAX_HANDLES 256
+static jobject   g_views[MAX_HANDLES]     = {0};
+static PyObject* g_callbacks[MAX_HANDLES] = {0};
+static int       g_handle_count = 0;
+
+static JNIEnv* get_env(void) {
+    JNIEnv* env;
+    (*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL);
+    return env;
+}
+
+static int store_handle(jobject local_view_ref) {
+    if (g_handle_count >= MAX_HANDLES) {
+        LOGE("store_handle: MAX_HANDLES (%d) exceeded", MAX_HANDLES);
+        return -1;
+    }
+    JNIEnv* env = get_env();
+    g_views[g_handle_count]     = (*env)->NewGlobalRef(env, local_view_ref);
+    g_callbacks[g_handle_count] = NULL;
+    return g_handle_count++;
+}
+
+static int handle_valid(int h) {
+    return h >= 0 && h < g_handle_count && g_views[h] != NULL;
+}
 
 // Called when loadlibary is called
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
@@ -24,7 +58,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
 
 
 // ════════════════════════════════════════════════════════════════════════════
-//  ANDROID MODULE  — lives here 
+//  ANDROID MODULE  — lives here
 //  user does:  import android
 //  for android module the following embedded C is used
 // ════════════════════════════════════════════════════════════════════════════
@@ -34,8 +68,7 @@ static PyObject* py_flash_on(PyObject* self, PyObject* args) {
         PyErr_SetString(PyExc_RuntimeError, "Bridge not initialized");
         return NULL;
     }
-    JNIEnv* env;
-    (*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL);
+    JNIEnv* env = get_env();
 
     jclass    ctxClass       = (*env)->GetObjectClass(env, g_app_context);
     jmethodID getSysSvc      = (*env)->GetMethodID(env, ctxClass,
@@ -65,8 +98,7 @@ static PyObject* py_flash_off(PyObject* self, PyObject* args) {
         PyErr_SetString(PyExc_RuntimeError, "Bridge not initialized");
         return NULL;
     }
-    JNIEnv* env;
-    (*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL);
+    JNIEnv* env = get_env();
 
     jclass    ctxClass   = (*env)->GetObjectClass(env, g_app_context);
     jmethodID getSysSvc  = (*env)->GetMethodID(env, ctxClass,
@@ -91,19 +123,225 @@ static PyObject* py_flash_off(PyObject* self, PyObject* args) {
     Py_RETURN_NONE;
 }
 
-// ── More functions will be added here later like notification ,etc ,etc
-// static PyObject* py_vibrate(...)  { ... } 
-// static PyObject* py_notify(...)   { ... }
+// ── More non-UI functions go here later: vibrate, notify, etc ──────────────
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  UI FUNCTIONS  — handle-based, so Python only ever sees plain ints.
+//  All of these must be called on the UI thread. Right now that's true by
+//  construction: initPython()/runScript() are called from onCreate() (UI
+//  thread), and Android delivers click events on the UI thread too, so a
+//  script that builds UI at top level and reacts to clicks via callbacks
+//  never needs to hop threads. If you ever call runScript() from a
+//  background thread, this breaks — you'd need runOnUiThread() from Java.
+// ════════════════════════════════════════════════════════════════════════════
+
+static PyObject* py_ui_create_label(PyObject* self, PyObject* args) {
+    const char* text;
+    if (!PyArg_ParseTuple(args, "s", &text)) return NULL;
+    JNIEnv* env = get_env();
+
+    jclass tvClass = (*env)->FindClass(env, "android/widget/TextView");
+    jmethodID ctor = (*env)->GetMethodID(env, tvClass, "<init>", "(Landroid/content/Context;)V");
+    jobject tv = (*env)->NewObject(env, tvClass, ctor, g_app_context);
+
+    jmethodID setText = (*env)->GetMethodID(env, tvClass, "setText", "(Ljava/lang/CharSequence;)V");
+    jstring jtext = (*env)->NewStringUTF(env, text);
+    (*env)->CallVoidMethod(env, tv, setText, jtext);
+
+    int handle = store_handle(tv);
+
+    (*env)->DeleteLocalRef(env, jtext);
+    (*env)->DeleteLocalRef(env, tv);
+    (*env)->DeleteLocalRef(env, tvClass);
+
+    if (handle < 0) { PyErr_SetString(PyExc_RuntimeError, "too many widgets"); return NULL; }
+    return PyLong_FromLong(handle);
+}
+
+static PyObject* py_ui_create_button(PyObject* self, PyObject* args) {
+    const char* text;
+    if (!PyArg_ParseTuple(args, "s", &text)) return NULL;
+    JNIEnv* env = get_env();
+
+    jclass btnClass = (*env)->FindClass(env, "android/widget/Button");
+    jmethodID ctor = (*env)->GetMethodID(env, btnClass, "<init>", "(Landroid/content/Context;)V");
+    jobject btn = (*env)->NewObject(env, btnClass, ctor, g_app_context);
+
+    jmethodID setText = (*env)->GetMethodID(env, btnClass, "setText", "(Ljava/lang/CharSequence;)V");
+    jstring jtext = (*env)->NewStringUTF(env, text);
+    (*env)->CallVoidMethod(env, btn, setText, jtext);
+
+    int handle = store_handle(btn);
+    if (handle < 0) {
+        (*env)->DeleteLocalRef(env, jtext);
+        (*env)->DeleteLocalRef(env, btn);
+        (*env)->DeleteLocalRef(env, btnClass);
+        PyErr_SetString(PyExc_RuntimeError, "too many widgets");
+        return NULL;
+    }
+
+    // Wire up NativeClickListener(handle) so onClick() calls back into us.
+    jclass listenerClass = (*env)->FindClass(env, "com/example/helloworld/NativeClickListener");
+    jmethodID lctor = (*env)->GetMethodID(env, listenerClass, "<init>", "(I)V");
+    jobject listener = (*env)->NewObject(env, listenerClass, lctor, (jint)handle);
+
+    jclass viewClass = (*env)->FindClass(env, "android/view/View");
+    jmethodID setOnClick = (*env)->GetMethodID(env, viewClass, "setOnClickListener",
+                                "(Landroid/view/View$OnClickListener;)V");
+    (*env)->CallVoidMethod(env, btn, setOnClick, listener);
+
+    (*env)->DeleteLocalRef(env, jtext);
+    (*env)->DeleteLocalRef(env, btn);
+    (*env)->DeleteLocalRef(env, btnClass);
+    (*env)->DeleteLocalRef(env, listener);
+    (*env)->DeleteLocalRef(env, listenerClass);
+    (*env)->DeleteLocalRef(env, viewClass);
+
+    return PyLong_FromLong(handle);
+}
+
+static PyObject* py_ui_create_layout(PyObject* self, PyObject* args) {
+    const char* orientation;
+    if (!PyArg_ParseTuple(args, "s", &orientation)) return NULL;
+    JNIEnv* env = get_env();
+
+    jclass llClass = (*env)->FindClass(env, "android/widget/LinearLayout");
+    jmethodID ctor = (*env)->GetMethodID(env, llClass, "<init>", "(Landroid/content/Context;)V");
+    jobject ll = (*env)->NewObject(env, llClass, ctor, g_app_context);
+
+    jmethodID setOrientation = (*env)->GetMethodID(env, llClass, "setOrientation", "(I)V");
+    jint orient = (strcmp(orientation, "horizontal") == 0) ? 0 : 1; // HORIZONTAL=0, VERTICAL=1
+    (*env)->CallVoidMethod(env, ll, setOrientation, orient);
+
+    int handle = store_handle(ll);
+
+    (*env)->DeleteLocalRef(env, ll);
+    (*env)->DeleteLocalRef(env, llClass);
+
+    if (handle < 0) { PyErr_SetString(PyExc_RuntimeError, "too many widgets"); return NULL; }
+    return PyLong_FromLong(handle);
+}
+
+static PyObject* py_ui_set_text(PyObject* self, PyObject* args) {
+    int handle;
+    const char* text;
+    if (!PyArg_ParseTuple(args, "is", &handle, &text)) return NULL;
+    if (!handle_valid(handle)) {
+        PyErr_SetString(PyExc_ValueError, "invalid widget handle");
+        return NULL;
+    }
+    JNIEnv* env = get_env();
+    jobject view = g_views[handle];
+
+    // Works for both TextView and Button (Button extends TextView).
+    jclass viewClass = (*env)->GetObjectClass(env, view);
+    jmethodID setText = (*env)->GetMethodID(env, viewClass, "setText", "(Ljava/lang/CharSequence;)V");
+    jstring jtext = (*env)->NewStringUTF(env, text);
+    (*env)->CallVoidMethod(env, view, setText, jtext);
+
+    (*env)->DeleteLocalRef(env, jtext);
+    (*env)->DeleteLocalRef(env, viewClass);
+    Py_RETURN_NONE;
+}
+
+static PyObject* py_ui_set_onclick(PyObject* self, PyObject* args) {
+    int handle;
+    PyObject* callback;
+    if (!PyArg_ParseTuple(args, "iO", &handle, &callback)) return NULL;
+    if (!handle_valid(handle)) {
+        PyErr_SetString(PyExc_ValueError, "invalid widget handle");
+        return NULL;
+    }
+    if (!PyCallable_Check(callback)) {
+        PyErr_SetString(PyExc_TypeError, "callback must be callable");
+        return NULL;
+    }
+    Py_XDECREF(g_callbacks[handle]);
+    Py_INCREF(callback);
+    g_callbacks[handle] = callback;
+    Py_RETURN_NONE;
+}
+
+static PyObject* py_ui_add_view(PyObject* self, PyObject* args) {
+    int parentHandle, childHandle;
+    if (!PyArg_ParseTuple(args, "ii", &parentHandle, &childHandle)) return NULL;
+    if (!handle_valid(parentHandle) || !handle_valid(childHandle)) {
+        PyErr_SetString(PyExc_ValueError, "invalid widget handle");
+        return NULL;
+    }
+    JNIEnv* env = get_env();
+    jobject parent = g_views[parentHandle];
+    jobject child  = g_views[childHandle];
+
+    jclass lpClass = (*env)->FindClass(env, "android/widget/LinearLayout$LayoutParams");
+    jmethodID lpCtor = (*env)->GetMethodID(env, lpClass, "<init>", "(II)V");
+    jobject lp = (*env)->NewObject(env, lpClass, lpCtor, (jint)-2, (jint)-2); // WRAP_CONTENT x2
+
+    jclass vgClass = (*env)->FindClass(env, "android/view/ViewGroup");
+    jmethodID addView = (*env)->GetMethodID(env, vgClass, "addView",
+                            "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V");
+    (*env)->CallVoidMethod(env, parent, addView, child, lp);
+
+    (*env)->DeleteLocalRef(env, lp);
+    (*env)->DeleteLocalRef(env, lpClass);
+    (*env)->DeleteLocalRef(env, vgClass);
+    Py_RETURN_NONE;
+}
+
+static PyObject* py_ui_show(PyObject* self, PyObject* args) {
+    int handle;
+    if (!PyArg_ParseTuple(args, "i", &handle)) return NULL;
+    if (!handle_valid(handle)) {
+        PyErr_SetString(PyExc_ValueError, "invalid widget handle");
+        return NULL;
+    }
+    JNIEnv* env = get_env();
+    jobject view = g_views[handle];
+
+    // g_app_context must actually be the Activity for this to resolve.
+    jclass actClass = (*env)->GetObjectClass(env, g_app_context);
+    jmethodID setContentView = (*env)->GetMethodID(env, actClass, "setContentView", "(Landroid/view/View;)V");
+    (*env)->CallVoidMethod(env, g_app_context, setContentView, view);
+
+    (*env)->DeleteLocalRef(env, actClass);
+    Py_RETURN_NONE;
+}
+
+// Called from NativeClickListener.onClick() -> nativeOnClick(handle)
+JNIEXPORT void JNICALL
+Java_com_example_helloworld_NativeClickListener_nativeOnClick(JNIEnv* env, jobject thiz, jint handle) {
+    if (!handle_valid((int)handle)) return;
+    PyObject* cb = g_callbacks[handle];
+    if (!cb) return;
+
+    PyObject* result = PyObject_CallObject(cb, NULL);
+    if (!result) {
+        LOGE("nativeOnClick: Python callback raised an exception");
+        PyErr_Print();
+    } else {
+        Py_DECREF(result);
+    }
+}
 
 static PyMethodDef AndroidMethods[] = {
-    {"flash_on",  py_flash_on,  METH_NOARGS,  "Turn on flashlight"},
-    {"flash_off", py_flash_off, METH_NOARGS,  "Turn off flashlight"},
+    {"flash_on",         py_flash_on,         METH_NOARGS,  "Turn on flashlight"},
+    {"flash_off",        py_flash_off,        METH_NOARGS,  "Turn off flashlight"},
+
+    {"ui_create_label",  py_ui_create_label,  METH_VARARGS, "ui_create_label(text) -> handle"},
+    {"ui_create_button", py_ui_create_button, METH_VARARGS, "ui_create_button(text) -> handle"},
+    {"ui_create_layout", py_ui_create_layout, METH_VARARGS, "ui_create_layout('vertical'|'horizontal') -> handle"},
+    {"ui_set_text",      py_ui_set_text,      METH_VARARGS, "ui_set_text(handle, text)"},
+    {"ui_set_onclick",   py_ui_set_onclick,   METH_VARARGS, "ui_set_onclick(handle, callback)"},
+    {"ui_add_view",      py_ui_add_view,      METH_VARARGS, "ui_add_view(parent_handle, child_handle)"},
+    {"ui_show",          py_ui_show,          METH_VARARGS, "ui_show(handle)"},
+
     {NULL, NULL, 0, NULL}
 };
 
 static struct PyModuleDef androidmodule = {
     PyModuleDef_HEAD_INIT,
-    "android",       
+    "android",
     NULL,
     -1,
     AndroidMethods
@@ -116,7 +354,6 @@ PyMODINIT_FUNC PyInit_android(void) {
 
 // ════════════════════════════════════════════════════════════════════════════
 //  JNI ENTRY POINTS  — from MainActivity.java
-//  For java as above
 // ════════════════════════════════════════════════════════════════════════════
 
 JNIEXPORT void JNICALL
@@ -128,6 +365,8 @@ Java_com_example_helloworld_MainActivity_initPython(
         return;
     }
 
+    // NOTE: `context` must be the Activity (pass `this` from Java), not
+    // getApplicationContext() — the UI functions need setContentView().
     g_app_context = (*env)->NewGlobalRef(env, context);
 
     const char* fd = (*env)->GetStringUTFChars(env, jFilesDir, NULL);
@@ -196,9 +435,8 @@ Java_com_example_helloworld_MainActivity_runScript(
         ret = (*env)->NewStringUTF(env, PyUnicode_AsUTF8(result));
     } else {
         LOGE("runScript: no 'result' variable found in script");
-        ret = (*env)->NewStringUTF(env, "error: script must set result = '...'");
+        ret = (*env)->NewStringUTF(env, "error: script must set result = '...'"); // legacy #TODO REMOVE THIS
     }
 
     return ret;
 }
-

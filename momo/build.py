@@ -299,15 +299,18 @@ def build_python():
 
     run(
         "Compiling Java Code to Classes",
-        ["javac", "-d", p.build, p.src / "MainActivity.java", "-classpath", p.android_jar],
+            ["javac", "-d", p.build,
+            p.src / "MainActivity.java", p.src / "NativeClickListener.java",
+            "-classpath", p.android_jar],
     )
 
     run(
         "Compiling .classes to .dex",
-        [
+            [
             p.d8, "--output", p.build / "dex",
             "--lib", p.android_jar,
             p.build / "com" / "example" / "helloworld" / "MainActivity.class",
+            p.build / "com" / "example" / "helloworld" / "NativeClickListener.class",
         ],
     )
 
@@ -396,19 +399,21 @@ def build():
     p.build.mkdir(parents=True, exist_ok=True)
 
     run(
-        "Compiling Java Code to Classes",
-        ["javac", "-d", p.build, p.src / "MainActivity.java", "-classpath", p.android_jar],
-    )
+    "Compiling Java Code to Classes",
+    ["javac", "-d", p.build,
+     p.src / "MainActivity.java", p.src / "NativeClickListener.java",
+     "-classpath", p.android_jar],
+)
 
     run(
-        "Compiling .classes to .dex",
-        [
-            p.d8, "--output", p.build / "dex",
-            "--lib", p.android_jar,
-            p.build / "com" / "example" / "helloworld" / "MainActivity.class",
-        ],
-    )
-
+    "Compiling .classes to .dex",
+    [
+        p.d8, "--output", p.build / "dex",
+        "--lib", p.android_jar,
+        p.build / "com" / "example" / "helloworld" / "MainActivity.class",
+        p.build / "com" / "example" / "helloworld" / "NativeClickListener.class",
+    ],
+)
     run(
         "Compiling Resources and stuff",
         [p.aapt2, "compile", "-o", p.build / "res.zip", p.res / "values" / "strings.xml"],

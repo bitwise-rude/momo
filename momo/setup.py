@@ -52,13 +52,18 @@ if not momo_dir.exists():
     )
 
     shutil.copy2(
+        module_dir / "NativeClickListener.java",
+        momo_dir / "src/NativeClickListener.java"
+    )
+
+    shutil.copy2(
         module_dir / "glue.c",
         momo_dir / "src/test.c"
     )
 
 
     # python stuff copy from .momo in home
-
+    shutil.copytree( module_dir/ "momoui", (momo_dir / "assets/python/lib/python3.14/momoui") )
     shutil.copytree(
         prefix / "include",
         momo_dir / "python/include",

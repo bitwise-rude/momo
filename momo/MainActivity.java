@@ -2,7 +2,6 @@ package com.example.helloworld;
 
 import android.app.Activity;
 import android.os.Bundle;
-import android.widget.TextView;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
@@ -25,22 +24,22 @@ public class MainActivity extends Activity {
         // 1. extract assets first
         extractPythonIfNeeded();
 
-        // 2. init python ONCE — passing context + filesDir from Java
-        //    TODO FOR ME: never hardcode /data/data/... paths in C
-        initPython(getApplicationContext(), getFilesDir().getAbsolutePath());
+        // 2. init python ONCE — pass `this` (the Activity), not
+        //    getApplicationContext(). The native UI functions (ui_show, in
+        //    particular) need setContentView(), which only exists on
+        //    Activity, not on the bare application Context.
+        initPython(this, getFilesDir().getAbsolutePath());
 
-        // 3. run script and show result
-        TextView tv = new TextView(this);
-        tv.setTextSize(20f);
+        // 3. run the script. If it builds a UI, it calls ui.show(...) itself
+        //    (via momoui) and setContentView() happens on the native side —
+        //    we don't need to do anything with the view here.
         try {
             String result = runScript("main.py");
-            tv.setText(result);
+            android.util.Log.d("MainActivity", "runScript result: " + result);
         } catch (Exception e) {
-            tv.setText("Error: " + e.toString());
+            e.printStackTrace();
         }
-        setContentView(tv);
     }
-
 
     private void extractPythonIfNeeded() {
         File outDir = new File(getFilesDir(), "python");
@@ -87,4 +86,3 @@ public class MainActivity extends Activity {
         out.close();
     }
 }
-
